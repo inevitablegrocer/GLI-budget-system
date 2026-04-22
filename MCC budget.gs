@@ -1,19 +1,9 @@
 /**
  * budget.gs
- * GLI Budget Pacing System
+ * Runs in: MCC Ads Script project only (NOT in the Budget Workbook sheet project)
  *
- * Handles:
- *   - Recommended budget calculations (Patterns A, B, C)
- *   - Pacing math (targetDaily, impliedMonthly, variance)
- *   - Budget stage determination
- *   - Budget alignment validation
- *
- * Dependencies (shared global scope):
- *   - configManager  (config.gs)
- *   - campaignParser (campaignParser.gs)
- *   - utils          (utils.gs)
- *
- * No imports needed — all .gs files share a single Apps Script global scope.
+ * Dependencies — paste these files into the same Ads Script project:
+ *   config.gs, campaignParser.gs, utils.gs
  */
 
 // ---------------------------------------------------------------------------
