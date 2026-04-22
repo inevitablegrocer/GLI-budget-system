@@ -234,6 +234,137 @@ function prepareNextMonthBudgetInput(clientConfig) {
 // ─── Send to Client ───────────────────────────────────────────────────────────
 
 /**
+ * Validate that facility budgets are internally consistent before sending to client.
+ * Rules:
+ *   - Col D must be identical for all rows sharing a location (conflicting totals = error)
+ *   - fixed_memory rows are anchored at col F (recommended budget)
+ *   - percentage rows' col F values must sum to (facilityTotal - fixedTotal), ±$1 tolerance
+ *   - If facility is all-fixed or all-percentage, all col F values must sum to facilityTotal ±$1
+ * @param {Array[]} agencyData — full sheet getValues() including header row
+ * @returns {{ valid: boolean, errors: Array<{facility: string, type: string, message: string}> }}
+ */
+function validateFacilityBudgets(agencyData) {
+  const C = BUDGET_INPUT_COLUMNS;
+  const TOLERANCE = 1.00;
+
+  // Group rows by location
+  const facilityMap = {}; // location → { rows: [], totalD: number|null, conflictD: boolean }
+
+  for (let i = 1; i < agencyData.length; i++) {
+    const row      = agencyData[i];
+    const location = row[C.location.index];
+    const type     = row[C.campaignType.index];
+    if (!location && !type) continue;
+
+    const facilityBudget  = Number(row[C.locationBudget.index]) || 0;
+    const authPattern     = (row[C.authPattern.index] || '').trim().toLowerCase();
+    const recommendedAmt  = Number(row[C.recommendedBudget.index]) || 0;
+    const noAds           = row[C.noAdsCheckbox.index] === true;
+
+    if (!facilityMap[location]) {
+      facilityMap[location] = { totalD: null, conflictD: false, rows: [] };
+    }
+    const fac = facilityMap[location];
+
+    // Check for conflicting col D values
+    if (fac.totalD === null) {
+      fac.totalD = facilityBudget;
+    } else if (Math.abs(fac.totalD - facilityBudget) > TOLERANCE) {
+      fac.conflictD = true;
+    }
+
+    fac.rows.push({ authPattern, recommendedAmt, noAds, type });
+  }
+
+  const errors = [];
+
+  for (const [location, fac] of Object.entries(facilityMap)) {
+    // Skip facilities where all rows are No Ads
+    if (fac.rows.every(r => r.noAds)) continue;
+
+    // Error: conflicting facility totals
+    if (fac.conflictD) {
+      errors.push({
+        facility: location,
+        type: 'conflicting_totals',
+        message: `"${location}" has conflicting Location Monthly Budget values in column D.`
+      });
+      continue; // Can't validate further without a reliable total
+    }
+
+    const facilityTotal = fac.totalD || 0;
+    const activeRows    = fac.rows.filter(r => !r.noAds);
+
+    const fixedRows      = activeRows.filter(r => r.authPattern === 'fixed_memory' || r.authPattern === 'annual_override');
+    const percentageRows = activeRows.filter(r => r.authPattern === 'percentage');
+
+    const fixedSum      = fixedRows.reduce((sum, r) => sum + r.recommendedAmt, 0);
+    const percentageSum = percentageRows.reduce((sum, r) => sum + r.recommendedAmt, 0);
+    const expectedPercentageTotal = facilityTotal - fixedSum;
+
+    if (percentageRows.length === 0) {
+      // All fixed — total must equal facility budget
+      const total = fixedSum;
+      if (Math.abs(total - facilityTotal) > TOLERANCE) {
+        errors.push({
+          facility: location,
+          type: 'budget_mismatch',
+          message: `"${location}": fixed budgets sum to $${total.toFixed(2)}, facility total is $${facilityTotal.toFixed(2)}.`
+        });
+      }
+    } else if (fixedRows.length === 0) {
+      // All percentage — total must equal facility budget
+      if (Math.abs(percentageSum - facilityTotal) > TOLERANCE) {
+        errors.push({
+          facility: location,
+          type: 'budget_mismatch',
+          message: `"${location}": percentage budgets sum to $${percentageSum.toFixed(2)}, facility total is $${facilityTotal.toFixed(2)}.`
+        });
+      }
+    } else {
+      // Mixed — percentage rows must account for the remainder after fixed
+      if (fixedSum > facilityTotal + TOLERANCE) {
+        errors.push({
+          facility: location,
+          type: 'budget_mismatch',
+          message: `"${location}": fixed budgets ($${fixedSum.toFixed(2)}) exceed facility total ($${facilityTotal.toFixed(2)}).`
+        });
+      } else if (Math.abs(percentageSum - expectedPercentageTotal) > TOLERANCE) {
+        errors.push({
+          facility: location,
+          type: 'budget_mismatch',
+          message: `"${location}": percentage budgets sum to $${percentageSum.toFixed(2)}, expected $${expectedPercentageTotal.toFixed(2)} (facility $${facilityTotal.toFixed(2)} minus fixed $${fixedSum.toFixed(2)}).`
+        });
+      }
+    }
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
+/**
+ * Format validation errors into a user-facing alert message.
+ * < 5 errors: list individually. >= 5 errors: summarize by type.
+ * @param {Array} errors
+ * @returns {string}
+ */
+function formatValidationAlert(errors) {
+  if (errors.length < 5) {
+    return 'Budget validation failed. Cannot send to client.\n\n' +
+      errors.map(e => `• ${e.message}`).join('\n');
+  }
+
+  // Summarize by type
+  const mismatches      = errors.filter(e => e.type === 'budget_mismatch').length;
+  const conflicting     = errors.filter(e => e.type === 'conflicting_totals').length;
+  const lines = ['Budget validation failed. Cannot send to client.\n'];
+  if (mismatches > 0)  lines.push(`• ${mismatches} facilit${mismatches === 1 ? 'y has' : 'ies have'} budget allocation mismatches.`);
+  if (conflicting > 0) lines.push(`• ${conflicting} facilit${conflicting === 1 ? 'y has' : 'ies have'} conflicting Location Monthly Budget values.`);
+  lines.push('\nFix all issues in the Budget Input sheet before sending.');
+  return lines.join('\n');
+}
+
+/**
  * Menu trigger: Push recommended budgets from agency sheet to client workbook.
  * Client workbook gets: Location, Campaign Type, Recommended Budget, approval checkbox.
  * @param {Object} clientConfig
@@ -258,6 +389,15 @@ function sendRecommendedBudgetsToClient(clientConfig) {
 
     // Build client-facing rows
     // Client sees: Location | Campaign Type | Recommended Budget | Approve? | No Ads?
+// ── Validate facility budgets before touching client workbook ──────────────
+    const validation = validateFacilityBudgets(agencyData);
+    if (!validation.valid) {
+      SpreadsheetApp.getUi().alert(formatValidationAlert(validation.errors));
+      return;
+    }
+
+    // Build client-facing rows
+    // Client sees: Location | Campaign Type | Recommended Budget | Approve? | No Ads?
     const CLIENT_HEADERS = [
       'Location', 'Campaign Type', 'Recommended Budget',
       'Recommended Budget Approved', 'No Ads This Month',
@@ -273,30 +413,62 @@ function sendRecommendedBudgetsToClient(clientConfig) {
       clientSheet.setFrozenRows(1);
     }
 
-    // Clear existing data rows (keep header)
+    // Build a map of existing client approvals to preserve already-sent rows
+    const existingApprovals = {}; // 'Location||Type' → { approved, noAds, approvalTs, disapprovalTs, notes }
     if (clientSheet.getLastRow() > 1) {
+      const existingData = clientSheet.getRange(2, 1, clientSheet.getLastRow() - 1, CLIENT_HEADERS.length).getValues();
+      for (const row of existingData) {
+        const key = `${row[0]}||${row[1]}`;
+        existingApprovals[key] = {
+          approved:      row[3],
+          noAds:         row[4],
+          approvalTs:    row[5],
+          disapprovalTs: row[6],
+          notes:         row[7]
+        };
+      }
       clientSheet.getRange(2, 1, clientSheet.getLastRow() - 1, CLIENT_HEADERS.length).clearContent();
     }
 
     const clientRows = [];
     for (let i = 1; i < agencyData.length; i++) {
-      const row = agencyData[i];
+      const row         = agencyData[i];
       const location    = row[BUDGET_INPUT_COLUMNS.location.index];
       const type        = row[BUDGET_INPUT_COLUMNS.campaignType.index];
       const recommended = row[BUDGET_INPUT_COLUMNS.recommendedBudget.index];
-      const noAds       = row[BUDGET_INPUT_COLUMNS.noAdsCheckbox.index];
+      const noAds       = row[BUDGET_INPUT_COLUMNS.noAdsCheckbox.index] === true;
 
       if (!location && !type) continue;
 
-      // Preserve existing approval state if row already exists in client sheet
-      // (don't overwrite a client's checkbox they already checked)
-      clientRows.push([location, type, recommended, false, noAds || false, '', '', '']);
+      const key      = `${location}||${type}`;
+      const existing = existingApprovals[key];
+
+      // Preserve approval state for rows the client has already reviewed.
+      // If the recommended budget has changed, reset approval so client must re-approve.
+      const budgetChanged = existing && (Number(existing.recommendedBudget) !== Number(recommended));
+      const wasApproved   = existing && existing.approved === true && !budgetChanged;
+      const approvalTs    = wasApproved ? (existing.approvalTs || '') : '';
+      const disapprovalTs = noAds      ? (existing ? existing.disapprovalTs || '' : '') : '';
+
+      clientRows.push([
+        location,
+        type,
+        noAds ? 0 : recommended,   // No Ads → $0 shown to client, not the stale recommended amount
+        wasApproved,
+        noAds,
+        approvalTs,
+        disapprovalTs,
+        existing ? existing.notes || '' : ''
+      ]);
     }
 
     if (clientRows.length > 0) {
       clientSheet.getRange(2, 1, clientRows.length, CLIENT_HEADERS.length).setValues(clientRows);
-      // Format budget column
+      // Format budget column as currency
       clientSheet.getRange(2, 3, clientRows.length, 1).setNumberFormat('$#,##0.00');
+      // Ensure approval and no-ads columns render as checkboxes
+      clientSheet.getRange(2, 4, clientRows.length, 2)
+        .setDataValidation(SpreadsheetApp.newDataValidation().requireCheckbox().build());
     }
 
     SpreadsheetApp.getActive().toast(
@@ -395,12 +567,13 @@ function syncApprovalsToAgencySheet(clientConfig) {
 
       const sheetRow = i + 1; // 1-based
 
-      // Write approved budget amount into col H
-      if (approval.approved && approval.recommendedBudget > 0) {
-        budgetSheet.getRange(sheetRow, BUDGET_INPUT_COLUMNS.approvedBudget.index + 1)
-          .setValue(approval.recommendedBudget)
+      // Write approved budget — No Ads always gets $0, approved rows get their amount
+      const approvedAmount = approval.noAds ? 0 : (approval.approved ? (approval.recommendedBudget || 0) : null);
+      if (approvedAmount !== null) {
+        sheet.getRange(rowIndex, BUDGET_INPUT_COLUMNS.approvedBudget.index + 1)
+          .setValue(approvedAmount)
           .setNumberFormat('$#,##0.00');
-      }
+}
 
       // Write approval checkbox col I
       budgetSheet.getRange(sheetRow, BUDGET_INPUT_COLUMNS.approvedCheckbox.index + 1)
