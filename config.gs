@@ -1,6 +1,15 @@
 /**
  * GLI Budget Pacing System - Configuration Module
- * Version: 2.1.0
+ * Version: 2.2.0
+ *
+ * Changelog v2.2.0:
+ *   - CLIENTS_COLUMNS: added 'approvalSheetName' → 'Approval Sheet Name'
+ *   - LOCATIONS_COLUMNS: added 'campaignName' → 'Campaign Name'
+ *   - LOCATIONS_COLUMNS: added 'isActive' → 'Active'
+ *   - loadLocationsFromSheet: skips rows where Active = FALSE
+ *   - loadClientsFromSheet: loads approvalSheetName per client
+ *
+ * Runs in: MCC Ads Script project AND Budget Workbook sheet project
  *
  * Two source workbooks:
  *   AGENCY_CONFIG_URL  — locked, senior AM + dev only
@@ -57,6 +66,7 @@ const CLIENTS_COLUMNS = {
   agencySheetName:     'Agency Sheet Name',
   budgetInputSheet:    'Budget Input Sheet',
   clientWorkbookUrl:   'Client Workbook URL',
+  approvalSheetName:   'Approval Sheet Name',   // NEW v2.2.0 — tab name to read in client workbook
   accountManagerEmail: 'Account Manager Email',
   budgetCycle:         'Budget Cycle',
   annualStartMonth:    'Annual Start Month',
@@ -90,7 +100,9 @@ const LOCATIONS_COLUMNS = {
   state:           'State',
   facilityName:    'Facility Name',
   fullLocation:    'Full Location',
-  notes:           'Notes'
+  campaignName:    'Campaign Name',   // NEW v2.2.0 — e.g. "GLI - WA - Puyallup Meridian"
+  notes:           'Notes',
+  isActive:        'Active'           // NEW v2.2.0 — FALSE skips location from pacing
 };
 
 // ─── Main Config Loader ───────────────────────────────────────────────────────
@@ -139,7 +151,8 @@ function loadClientsFromSheet(ss) {
 
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
-    if (!row[idx.accountId] || row[idx.isActive] === false || row[idx.isActive] === 'FALSE') continue;
+    if (!row[idx.accountId]) continue;
+    if (row[idx.isActive] === false || String(row[idx.isActive]).toUpperCase() === 'FALSE') continue;
 
     const accountId = normalizeAccountId(row[idx.accountId]);
     clients[accountId] = {
@@ -148,6 +161,7 @@ function loadClientsFromSheet(ss) {
       agencySheetName:     row[idx.agencySheetName]     || '',
       budgetInputSheet:    row[idx.budgetInputSheet]     || '',
       clientWorkbookUrl:   row[idx.clientWorkbookUrl]   || '',
+      approvalSheetName:   row[idx.approvalSheetName]   || '',   // NEW v2.2.0
       accountManagerEmail: row[idx.accountManagerEmail] || '',
       budgetCycle:         row[idx.budgetCycle]         || BUDGET_CYCLES.MONTHLY,
       annualStartMonth:    Number(row[idx.annualStartMonth]) || 1,
@@ -182,10 +196,10 @@ function loadSplitRulesFromSheet(ss) {
 
     rules[accountId][campaignType] = {
       campaignType,
-      authPattern:     row[idx.authPattern]              || AUTHORIZATION_PATTERNS.PERCENTAGE,
+      authPattern:     row[idx.authPattern]                 || AUTHORIZATION_PATTERNS.PERCENTAGE,
       splitPercentage: parseFloat(row[idx.splitPercentage]) || null,
       fixedDefault:    parseFloat(row[idx.fixedDefault])    || null,
-      notes:           row[idx.notes]                    || ''
+      notes:           row[idx.notes]                       || ''
     };
   }
   return rules;
@@ -214,9 +228,23 @@ function loadThresholdsFromSheet(ss) {
 }
 
 /**
- * Load Locations tab. Lookup keyed by fullLocation (lowercase) per client.
+ * Load Locations tab.
  *
- * Shape: { accountId: { 'wa - puyallup meridian': { identifierLabel, identifierValue, state, facilityName, fullLocation } } }
+ * v2.2.0 changes:
+ *   - Skips rows where Active column = FALSE (inactive/sold locations)
+ *   - Loads campaignName for use as approval lookup key
+ *
+ * Lookup is keyed two ways per client:
+ *   1. By fullLocation lowercase  — used by campaignParser (existing)
+ *   2. By campaignName lowercase  — used by readClientApprovals (new)
+ *
+ * Shape:
+ * {
+ *   accountId: {
+ *     'wa - puyallup meridian': { identifierLabel, identifierValue, state, facilityName, fullLocation, campaignName, isActive },
+ *     'gli - wa - puyallup meridian': { ... same ... }   // campaignName key (lowercase)
+ *   }
+ * }
  */
 function loadLocationsFromSheet(ss) {
   const sheet = ss.getSheetByName('Locations');
@@ -226,27 +254,50 @@ function loadLocationsFromSheet(ss) {
   const headers   = data[0];
   const idx       = buildColumnIndex(headers, LOCATIONS_COLUMNS);
   const locations = {};
+  let   skipped   = 0;
 
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
     if (!row[idx.accountId] || !row[idx.fullLocation]) continue;
 
-    const accountId   = normalizeAccountId(row[idx.accountId]);
+    // NEW v2.2.0 — skip inactive locations
+    if (idx.isActive !== -1) {
+      const activeVal = row[idx.isActive];
+      if (activeVal === false || String(activeVal).toUpperCase() === 'FALSE') {
+        skipped++;
+        continue;
+      }
+    }
+
+    const accountId    = normalizeAccountId(row[idx.accountId]);
     const fullLocation = row[idx.fullLocation].toString().trim();
+    const campaignName = idx.campaignName !== -1 ? (row[idx.campaignName] || '').toString().trim() : '';
 
     if (!locations[accountId]) locations[accountId] = {};
 
-    locations[accountId][fullLocation.toLowerCase()] = {
+    const locationEntry = {
       identifierLabel: row[idx.identifierLabel] || '',
       identifierValue: row[idx.identifierValue] || '',
       state:           row[idx.state]           || '',
       facilityName:    row[idx.facilityName]    || '',
-      fullLocation
+      fullLocation,
+      campaignName,
+      isActive:        true
     };
+
+    // Key 1: by fullLocation (existing — used by campaignParser)
+    locations[accountId][fullLocation.toLowerCase()] = locationEntry;
+
+    // Key 2: by campaignName (new — used by readClientApprovals)
+    // Only add if campaignName is present and not a duplicate of fullLocation
+    if (campaignName && campaignName.toLowerCase() !== fullLocation.toLowerCase()) {
+      locations[accountId][campaignName.toLowerCase()] = locationEntry;
+    }
   }
 
   const total = Object.values(locations).reduce((sum, c) => sum + Object.keys(c).length, 0);
   utils.log(`Loaded ${total} locations across all clients`, utils.LOG_LEVELS.INFO);
+  if (skipped > 0) utils.log(`Skipped ${skipped} inactive locations`, utils.LOG_LEVELS.INFO);
   return locations;
 }
 
@@ -271,6 +322,7 @@ function validateClientConfig(clientConfig) {
   if (!clientConfig.clientWorkbookUrl) errors.push('Missing client workbook URL');
   if (!clientConfig.agencySheetName)   errors.push('Missing agency sheet name');
   if (!clientConfig.budgetInputSheet)  errors.push('Missing budget input sheet name');
+  if (!clientConfig.approvalSheetName) errors.push('Missing approval sheet name — readClientApprovals will not work');
   if (Object.keys(clientConfig.splitRules).length === 0)
     errors.push('No split rules defined');
   if (Object.keys(clientConfig.locationLookup).length === 0)
