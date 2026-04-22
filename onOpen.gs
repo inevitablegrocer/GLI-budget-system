@@ -6,25 +6,6 @@
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
 
-  // Ad Customizer (existing, out of scope)
-  try {
-    ui.createMenu('Ad Customizer')
-      .addItem('Open Tool', 'showPromoDialog')
-      .addToUi();
-  } catch (e) {
-    console.error('Error creating Ad Customizer menu:', e);
-  }
-
-  // AdPulse Verification (existing, will be deprecated)
-  try {
-    ui.createMenu('AdPulse Verification')
-      .addItem('Run Verification',     'runBudgetVerification')
-      .addItem('Verify Current Sheet', 'testVerifyCurrentSheet')
-      .addToUi();
-  } catch (e) {
-    console.error('Error creating AdPulse Verification menu:', e);
-  }
-
   // Budget Management (new)
   try {
     ui.createMenu('Budget Management')
@@ -38,12 +19,6 @@ function onOpen() {
     console.error('Error creating Budget Management menu:', e);
   }
 
-  // Initialize AdPulse sheet if needed
-  try {
-    initializeAdPulseSheet();
-  } catch (e) {
-    console.error('Error initializing AdPulse sheet:', e);
-  }
 }
 
 // ─── Menu Handler Stubs ───────────────────────────────────────────────────────
