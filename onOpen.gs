@@ -81,14 +81,6 @@ function menuRunPacingCheck() {
 function menuReadClientApprovals() {
   const clientConfig = promptSelectClient_();
   if (!clientConfig) return;
-  const approvals = readClientApprovals(clientConfig); 
-  const count = Object.keys(approvals).length;
-  SpreadsheetApp.getActive().toast(`Read ${count} approval rows from client workbook.`, 'Client Approvals', 4);
-}
-
-function menuReadClientApprovals() {
-  const clientConfig = promptSelectClient_();
-  if (!clientConfig) return;
   budgetInput.syncApprovalsToAgencySheet(clientConfig);
 }
 
