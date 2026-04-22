@@ -13,7 +13,7 @@
 // ─── Workbook URLs ────────────────────────────────────────────────────────────
 
 const AGENCY_CONFIG_URL = 'https://docs.google.com/spreadsheets/d/1wbendlP097_thluHa1hJtTFkacQ7eEYknAg5qdxQGXU/edit?gid=6446832#gid=6446832';
-const AGENCY_BUDGET_URL = 'Yhttps://docs.google.com/spreadsheets/d/1Vvq5p4vuvuFNkxdqn0whOlkClEBTzmssHMGvuTlSrdY/edit?gid=0#gid=0';
+const AGENCY_BUDGET_URL = 'https://docs.google.com/spreadsheets/d/1Vvq5p4vuvuFNkxdqn0whOlkClEBTzmssHMGvuTlSrdY/edit?gid=0#gid=0';
 const AGENCY_PREFIX     = 'GLI - ';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
