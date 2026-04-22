@@ -1,0 +1,523 @@
+/**
+ * dataCollection.gs
+ * GLI Budget Pacing System
+ *
+ * Queries the Google Ads API (via AdsApp) for campaign performance data and
+ * budget information, then runs each campaign through campaignParser to attach
+ * location/type/identifier fields.
+ *
+ * Entry points:
+ *   collectCampaignData(clientConfig, dates)   — current-month MTD performance
+ *   collectCampaignHistory(clientConfig, days)  — recent daily spend history
+ *
+ * Campaign object shape (post-parse):
+ * {
+ *   // From Google Ads API
+ *   id:                 string,
+ *   name:               string,
+ *   status:             string,   // ENABLED | PAUSED | REMOVED
+ *   currentDailyBudget: number,   // in dollars (API returns micros, converted here)
+ *   spendMTD:           number,   // cost this calendar month so far
+ *   impressions:        number,
+ *   clicks:             number,
+ *   ctr:                number,   // 0–1 decimal
+ *   bidStrategy:        string,
+ *   daysActive:         number,   // days since last budget change (from history)
+ *   lastBudgetChange:   string,   // ISO date string or '' if unknown
+ *
+ *   // Attached by campaignParser.parseCampaignNames()
+ *   location:           string,   // e.g. "WA - Puyallup Meridian"
+ *   facilityName:       string,   // e.g. "Puyallup Meridian"
+ *   state:              string,   // e.g. "WA"
+ *   campaignType:       string,   // e.g. "Search"
+ *   identifierLabel:    string,   // e.g. "Site Code"
+ *   identifierValue:    string,   // e.g. "TSPU2"
+ *   parsedName:         Object,   // full parse result from campaignParser
+ * }
+ *
+ * Dependencies (shared global scope):
+ *   - campaignParser  (campaignParser.gs)
+ *   - utils           (utils.gs)
+ *   - AdsApp          (Google Ads Scripts global — only available in Ads Scripts context)
+ */
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/**
+ * GAQL date range used for MTD spend queries.
+ * 'THIS_MONTH' is a built-in Google Ads date range token covering
+ * the 1st of the current month through yesterday (the most recent complete day).
+ */
+const GAQL_DATE_RANGE_MTD = 'THIS_MONTH';
+
+/**
+ * Micros-to-dollars conversion factor.
+ * Google Ads API returns monetary values in micros (millionths of currency unit).
+ */
+const MICROS_PER_DOLLAR = 1000000;
+
+/**
+ * Campaign statuses to include. REMOVED campaigns are excluded — they have no
+ * active budget and can't pace. PAUSED campaigns are included so the sheet
+ * reflects their zero-spend state explicitly.
+ */
+const INCLUDED_STATUSES = ['ENABLED', 'PAUSED'];
+
+// ---------------------------------------------------------------------------
+// collectCampaignData
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetches MTD performance data for all non-removed campaigns in the account,
+ * then runs campaignParser over the results to attach location/type/identifier.
+ *
+ * Uses two GAQL queries:
+ *   1. Campaign-level budget + status (current state)
+ *   2. Campaign-level MTD performance metrics (spend, impressions, clicks)
+ *
+ * The two result sets are merged on campaign ID before parsing.
+ *
+ * @param {Object} clientConfig  Full client config from configManager.getClientConfig()
+ * @param {Object} dates         Date context from budget.buildDatesObject()
+ * @returns {Object[]}           Array of campaign objects with parsed fields attached.
+ *                               Returns [] on any fatal query error.
+ */
+function collectCampaignData(clientConfig, dates) {
+  try {
+    // ── 1. Fetch current budget / status for all active campaigns ─────────────
+    const budgetMap = _fetchCampaignBudgets();
+    if (!budgetMap) return [];
+
+    // ── 2. Fetch MTD performance metrics ──────────────────────────────────────
+    const performanceMap = _fetchMtdPerformance(dates);
+    if (!performanceMap) return [];
+
+    // ── 3. Fetch budget change history to determine daysActive ────────────────
+    const historyMap = _fetchBudgetChangeHistory(clientConfig.thresholds
+      ? clientConfig.thresholds.velocityWindow || 30
+      : 30
+    );
+
+    // ── 4. Merge into campaign list ───────────────────────────────────────────
+    const campaignList = [];
+
+    for (const [campaignId, budgetRow] of Object.entries(budgetMap)) {
+      // Skip statuses we don't want to track
+      if (!INCLUDED_STATUSES.includes(budgetRow.status)) continue;
+
+      const perf    = performanceMap[campaignId] || {};
+      const history = historyMap[campaignId]     || {};
+
+      campaignList.push({
+        id:                 campaignId,
+        name:               budgetRow.name,
+        status:             budgetRow.status,
+        currentDailyBudget: budgetRow.dailyBudget,
+        spendMTD:           perf.cost          || 0,
+        impressions:        perf.impressions   || 0,
+        clicks:             perf.clicks        || 0,
+        ctr:                perf.ctr           || 0,
+        bidStrategy:        budgetRow.bidStrategy || '',
+        daysActive:         history.daysActive || 0,
+        lastBudgetChange:   history.lastChangeDate || '',
+
+        // Parser fields — populated below by campaignParser.parseCampaignNames()
+        location:        '',
+        facilityName:    '',
+        state:           '',
+        campaignType:    '',
+        identifierLabel: '',
+        identifierValue: '',
+        parsedName:      null,
+      });
+    }
+
+    // ── 5. Parse campaign names ───────────────────────────────────────────────
+    // Mutates each campaign object in place, attaching all parser fields.
+    campaignParser.parseCampaignNames(campaignList, clientConfig);
+
+    utils.log(
+      `collectCampaignData [${clientConfig.name}]: ${campaignList.length} campaigns fetched and parsed`,
+      utils.LOG_LEVELS.INFO
+    );
+
+    return campaignList;
+
+  } catch (error) {
+    utils.logError(`collectCampaignData failed for ${clientConfig.name}`, error);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// collectCampaignHistory
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns daily spend totals for the account over the past N days.
+ * Used for velocity analysis and trend display in the Campaigns tab.
+ *
+ * @param {number} [days=30]  Number of days of history to fetch (max 90 recommended)
+ * @returns {Object[]}        Array of { date, campaignId, campaignName, cost, impressions, clicks }
+ *                            sorted ascending by date. Returns [] on error.
+ */
+function collectCampaignHistory(days) {
+  const lookbackDays = days || 30;
+
+  try {
+    const query = `
+      SELECT
+        campaign.id,
+        campaign.name,
+        segments.date,
+        metrics.cost_micros,
+        metrics.impressions,
+        metrics.clicks
+      FROM campaign
+      WHERE
+        campaign.status != 'REMOVED'
+        AND segments.date DURING LAST_${lookbackDays}_DAYS
+      ORDER BY segments.date ASC, campaign.name ASC
+    `;
+
+    const report = AdsApp.search(query);
+    const rows   = [];
+
+    while (report.hasNext()) {
+      const row = report.next();
+      rows.push({
+        date:         row.segments.date,
+        campaignId:   row.campaign.id,
+        campaignName: row.campaign.name,
+        cost:         _microsToDollars(row.metrics.costMicros),
+        impressions:  Number(row.metrics.impressions) || 0,
+        clicks:       Number(row.metrics.clicks)      || 0,
+      });
+    }
+
+    utils.log(`collectCampaignHistory: ${rows.length} daily rows over ${lookbackDays} days`, utils.LOG_LEVELS.INFO);
+    return rows;
+
+  } catch (error) {
+    utils.logError('collectCampaignHistory failed', error);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Private — GAQL query helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetches current daily budget, status, and bid strategy for every
+ * non-removed campaign in the account.
+ *
+ * @returns {Object|null}  Map of campaignId → { name, status, dailyBudget, bidStrategy }
+ *                         Returns null on query failure.
+ */
+function _fetchCampaignBudgets() {
+  try {
+    const query = `
+      SELECT
+        campaign.id,
+        campaign.name,
+        campaign.status,
+        campaign_budget.amount_micros,
+        campaign.bidding_strategy_type
+      FROM campaign
+      WHERE campaign.status != 'REMOVED'
+      ORDER BY campaign.name ASC
+    `;
+
+    const report = AdsApp.search(query);
+    const map    = {};
+
+    while (report.hasNext()) {
+      const row        = report.next();
+      const campaignId = row.campaign.id;
+
+      map[campaignId] = {
+        name:        row.campaign.name,
+        status:      row.campaign.status,
+        dailyBudget: _microsToDollars(row.campaignBudget.amountMicros),
+        bidStrategy: _normalizeBidStrategy(row.campaign.biddingStrategyType),
+      };
+    }
+
+    utils.log(`_fetchCampaignBudgets: ${Object.keys(map).length} campaigns`, utils.LOG_LEVELS.DEBUG);
+    return map;
+
+  } catch (error) {
+    utils.logError('_fetchCampaignBudgets query failed', error);
+    return null;
+  }
+}
+
+/**
+ * Fetches MTD cost, impressions, and clicks for all non-removed campaigns.
+ *
+ * Uses THIS_MONTH date range, which covers the 1st of the current month
+ * through yesterday. Today's partial spend is not included — consistent with
+ * how Google Ads reports cost and with the pacing math in budget.gs.
+ *
+ * @returns {Object|null}  Map of campaignId → { cost, impressions, clicks, ctr }
+ *                         Returns null on query failure.
+ */
+function _fetchMtdPerformance(dates) {
+  try {
+    // If today is the 1st of the month, THIS_MONTH has no data yet.
+    // Return empty map — all MTD values will be 0, which is correct.
+    if (dates.dayOfMonth === 1) {
+      utils.log('_fetchMtdPerformance: day 1 of month — MTD spend is 0 for all campaigns', utils.LOG_LEVELS.INFO);
+      return {};
+    }
+
+    const query = `
+      SELECT
+        campaign.id,
+        metrics.cost_micros,
+        metrics.impressions,
+        metrics.clicks,
+        metrics.ctr
+      FROM campaign
+      WHERE
+        campaign.status != 'REMOVED'
+        AND segments.date DURING ${GAQL_DATE_RANGE_MTD}
+    `;
+
+    const report = AdsApp.search(query);
+    const map    = {};
+
+    while (report.hasNext()) {
+      const row        = report.next();
+      const campaignId = row.campaign.id;
+
+      map[campaignId] = {
+        cost:        _microsToDollars(row.metrics.costMicros),
+        impressions: Number(row.metrics.impressions) || 0,
+        clicks:      Number(row.metrics.clicks)      || 0,
+        ctr:         Number(row.metrics.ctr)         || 0,
+      };
+    }
+
+    utils.log(`_fetchMtdPerformance: ${Object.keys(map).length} campaigns with MTD data`, utils.LOG_LEVELS.DEBUG);
+    return map;
+
+  } catch (error) {
+    utils.logError('_fetchMtdPerformance query failed', error);
+    return null;
+  }
+}
+
+/**
+ * Determines how many days each campaign's budget has been stable by looking
+ * at recent daily budget snapshots from the change history.
+ *
+ * Google Ads Scripts doesn't expose a direct "days since last budget change"
+ * field, so we approximate: fetch daily budget_amount_micros per campaign over
+ * the past N days and count consecutive days (from today backwards) where the
+ * budget hasn't changed.
+ *
+ * @param {number} lookbackDays  How many days of history to examine
+ * @returns {Object}             Map of campaignId → { daysActive, lastChangeDate }
+ */
+function _fetchBudgetChangeHistory(lookbackDays) {
+  try {
+    const days = Math.min(Math.max(lookbackDays || 30, 7), 90); // clamp 7–90
+
+    const query = `
+      SELECT
+        campaign.id,
+        campaign_budget.amount_micros,
+        segments.date
+      FROM campaign
+      WHERE
+        campaign.status != 'REMOVED'
+        AND segments.date DURING LAST_${days}_DAYS
+      ORDER BY campaign.id ASC, segments.date DESC
+    `;
+
+    const report = AdsApp.search(query);
+
+    // Collect per-campaign budget history: campaignId → [{ date, budget }, ...]
+    // Rows arrive in DESC date order per campaign due to ORDER BY above.
+    const historyByCampaign = {};
+
+    while (report.hasNext()) {
+      const row        = report.next();
+      const campaignId = row.campaign.id;
+      const budget     = _microsToDollars(row.campaignBudget.amountMicros);
+      const date       = row.segments.date; // "YYYY-MM-DD"
+
+      if (!historyByCampaign[campaignId]) historyByCampaign[campaignId] = [];
+      historyByCampaign[campaignId].push({ date, budget });
+    }
+
+    // For each campaign, walk backwards from today to find the first day
+    // the budget was different — that's the last change date.
+    const result = {};
+
+    for (const [campaignId, history] of Object.entries(historyByCampaign)) {
+      if (history.length === 0) {
+        result[campaignId] = { daysActive: days, lastChangeDate: '' };
+        continue;
+      }
+
+      // history[0] is the most recent day (DESC order)
+      const currentBudget = history[0].budget;
+      let   daysActive    = 0;
+      let   lastChangeDate = '';
+
+      for (let i = 0; i < history.length; i++) {
+        if (history[i].budget === currentBudget) {
+          daysActive++;
+        } else {
+          // Budget was different on this day — change happened between history[i] and history[i-1]
+          lastChangeDate = history[i].date;
+          break;
+        }
+      }
+
+      // If budget was stable for the entire lookback window, daysActive = lookback length
+      // and lastChangeDate remains '' (unknown — older than our window)
+      result[campaignId] = { daysActive, lastChangeDate };
+    }
+
+    utils.log(`_fetchBudgetChangeHistory: computed daysActive for ${Object.keys(result).length} campaigns`, utils.LOG_LEVELS.DEBUG);
+    return result;
+
+  } catch (error) {
+    utils.logError('_fetchBudgetChangeHistory query failed', error);
+    return {}; // non-fatal — daysActive will default to 0 (newBudget stage)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Private — conversion helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Converts Google Ads API micros value to dollars.
+ * Handles string input (GAQL returns numbers, but defensive parsing is cheap).
+ *
+ * @param {number|string} micros
+ * @returns {number}
+ */
+function _microsToDollars(micros) {
+  const n = Number(micros);
+  if (isNaN(n)) return 0;
+  return n / MICROS_PER_DOLLAR;
+}
+
+/**
+ * Normalizes Google Ads bidding strategy type strings to friendlier labels.
+ * GAQL returns SCREAMING_SNAKE_CASE enum names.
+ *
+ * @param {string} raw  e.g. "TARGET_CPA" | "MAXIMIZE_CONVERSIONS" | "MANUAL_CPC"
+ * @returns {string}    e.g. "Target CPA" | "Max Conversions" | "Manual CPC"
+ */
+function _normalizeBidStrategy(raw) {
+  if (!raw) return '';
+  const map = {
+    TARGET_CPA:                  'Target CPA',
+    TARGET_ROAS:                 'Target ROAS',
+    MAXIMIZE_CONVERSIONS:        'Max Conversions',
+    MAXIMIZE_CONVERSION_VALUE:   'Max Conv. Value',
+    TARGET_IMPRESSION_SHARE:     'Target Impr. Share',
+    MANUAL_CPC:                  'Manual CPC',
+    MANUAL_CPM:                  'Manual CPM',
+    ENHANCED_CPC:                'eCPC',
+    PERCENT_CPC:                 'Percent CPC',
+  };
+  return map[raw] || raw;
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics — run from Apps Script editor
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetches and logs campaign data for the first configured client.
+ * Run manually from the Apps Script editor to verify queries and parsing.
+ * Requires AdsApp context (run from Google Ads Scripts, not Sheets).
+ */
+function testDataCollection() {
+  const config = configManager.loadConfiguration();
+  const clients = Object.values(config.clients);
+  if (clients.length === 0) {
+    Logger.log('testDataCollection: no clients loaded');
+    return;
+  }
+
+  const clientConfig = configManager.getClientConfig(clients[0].accountId, config);
+  const dates        = budget.buildDatesObject();
+
+  Logger.log(`=== testDataCollection for ${clientConfig.name} ===`);
+  Logger.log(`Date context: dayOfMonth=${dates.dayOfMonth}, daysRemaining=${dates.daysRemaining}, daysInMonth=${dates.daysInMonth}`);
+
+  const campaigns = collectCampaignData(clientConfig, dates);
+
+  Logger.log(`Fetched ${campaigns.length} campaigns`);
+
+  // Log first 5 as a spot-check
+  campaigns.slice(0, 5).forEach(c => {
+    Logger.log([
+      `\nName:      "${c.name}"`,
+      `Status:    ${c.status}`,
+      `Daily:     $${c.currentDailyBudget.toFixed(2)}`,
+      `SpendMTD:  $${c.spendMTD.toFixed(2)}`,
+      `DaysActive:${c.daysActive}`,
+      `Location:  "${c.location}"`,
+      `Type:      "${c.campaignType}"`,
+      `SiteCode:  "${c.identifierValue}"`,
+      `Warnings:  ${c.parsedName ? c.parsedName.parseWarnings.join('; ') || 'none' : 'not parsed'}`,
+    ].join('\n'));
+  });
+
+  // Log campaigns with parse warnings
+  const withWarnings = campaigns.filter(c => c.parsedName && c.parsedName.parseWarnings.length > 0);
+  if (withWarnings.length > 0) {
+    Logger.log(`\n=== ${withWarnings.length} campaigns with parse warnings ===`);
+    withWarnings.forEach(c => {
+      Logger.log(`"${c.name}": ${c.parsedName.parseWarnings.join(' | ')}`);
+    });
+  }
+}
+
+/**
+ * Tests collectCampaignHistory and logs a summary.
+ * Run from Google Ads Scripts editor.
+ */
+function testCampaignHistory() {
+  Logger.log('=== testCampaignHistory (last 30 days) ===');
+  const rows = collectCampaignHistory(30);
+  Logger.log(`Total rows: ${rows.length}`);
+
+  if (rows.length > 0) {
+    Logger.log(`Date range: ${rows[0].date} → ${rows[rows.length - 1].date}`);
+
+    // Aggregate total spend per campaign
+    const totals = {};
+    rows.forEach(r => {
+      if (!totals[r.campaignName]) totals[r.campaignName] = 0;
+      totals[r.campaignName] += r.cost;
+    });
+
+    Logger.log('\nSpend by campaign (last 30 days):');
+    Object.entries(totals)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .forEach(([name, cost]) => Logger.log(`  $${cost.toFixed(2)}  ${name}`));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Module export
+// ---------------------------------------------------------------------------
+
+const dataCollection = {
+  collectCampaignData,
+  collectCampaignHistory,
+};
